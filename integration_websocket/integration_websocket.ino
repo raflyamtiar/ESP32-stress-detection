@@ -28,7 +28,7 @@ WebSocketsClient webSocket;
 #define GSR_PIN 34
 const float ADC10_MIN = 35.0f;
 const float ADC10_MAX = 800.0f;   // Range lebar (supaya nilai 630 masuk)
-const float GSR_EMA_ALPHA = 0.2f; // 0..1, semakin kecil semakin halus
+const float GSR_EMA_ALPHA = 1.0f; // 1.0 = tanpa smoothing
 const float BATAS_UDARA = 600.0f; // Di atas angka ini diasumsikan lepas/udara
 
 // Rumus Polinomial
@@ -180,15 +180,7 @@ void loop() {
     float adc12 = sum / 20.0;
     float adc10 = adc12 * (1023.0f / 4095.0f);
 
-    // Smoothing supaya lonjakan kecil tidak langsung mengubah output
-    if (!gsrFilterPrimed) {
-      gsrFilteredAdc10 = adc10;
-      gsrFilterPrimed = true;
-    } else {
-      gsrFilteredAdc10 = (GSR_EMA_ALPHA * adc10) + ((1.0f - GSR_EMA_ALPHA) * gsrFilteredAdc10);
-    }
-
-    float adc10Smooth = gsrFilteredAdc10;
+    float adc10Smooth = adc10; // EMA dimatikan
     
     // Logika Threshold
     if (adc10Smooth >= ADC10_MIN && adc10Smooth <= ADC10_MAX) {
