@@ -1,237 +1,318 @@
 #include <WiFi.h>
+#include <WiFiManager.h> // Pastikan library "WiFiManager" by tzapu terinstall
 #include <WebSocketsClient.h> // Library: "WebSockets" by Markus Sattler
-#include <Wire.h>
-#include <math.h>
-#include "MAX30105.h"
-#include "heartRate.h"
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
 
-// ============================================================
-// 1. KONFIGURASI WIFI & NGROK
-// ============================================================
-const char* ssid     = "POCO X3 Pro";
-const char* password = "12321213";
+// ================= KONFIGURASI WIFI =================
+const char* hardcode_ssid = "POCO X3 Pro"; 
+const char* hardcode_pass = "12321213";
+const char* ap_name = "ESP32_raply"; 
 
-// HOST NGROK (Tanpa https:// dan tanpa /)
-// CEK LAGI! Pastikan ini alamat Ngrok terbaru kamu
-const char* ws_host  = "premedical-caryl-gawkishly.ngrok-free.dev"; 
-
+// ================= KONFIGURASI NGROK / SOCKET.IO =================
+const char* ws_host  = "nichelle-attractive-transperitoneally.ngrok-free.dev";
 const int   ws_port  = 443; // Port SSL
 const char* ws_path  = "/socket.io/?EIO=4&transport=websocket&type=esp32";
 
 WebSocketsClient webSocket;
+unsigned long lastTimeWS = 0;
+const unsigned long INTERVAL_WS = 100; // Kirim 10Hz seperti referensi
+bool socketIoConnected = false;
 
-// ============================================================
-// 2. SETTINGAN OPTIMAL GSR
-// ============================================================
-#define GSR_PIN 34
-const float ADC10_MIN = 35.0f;
-const float ADC10_MAX = 800.0f;   // Range lebar (supaya nilai 630 masuk)
-const float GSR_EMA_ALPHA = 1.0f; // 1.0 = tanpa smoothing
-const float BATAS_UDARA = 600.0f; // Di atas angka ini diasumsikan lepas/udara
+// ================= KONFIGURASI DS18B20 (SUHU) =================
+#define ONE_WIRE_BUS 4 
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
 
-// Rumus Polinomial
-const float K4 =  8.32659e-09f;
-const float K3 = -6.45535e-06f;
-const float K2 =  0.00237126f;
-const float K1 =  0.086247663f;
-const float K0 =  48.19170232f;
+const float KALIBRASI_OFFSET = 0.50; 
+unsigned long lastTempRequest = 0;
+const long tempInterval = 1000; // Update suhu tiap 1000ms (1 detik)
+float tempC_final = 0.0;
 
-// Variabel Data
-float shared_GSR_uS = 0.0; 
-float shared_GSR_Ohm = 0.0; // Ditampilkan di Serial, TIDAK dikirim ke Web
-float gsrFilteredAdc10 = 0.0f;
-bool gsrFilterPrimed = false;
-
-// ============================================================
-// 3. SETTINGAN OPTIMAL MAX30102
-// ============================================================
+// ================= KONFIGURASI MAX30102 (JANTUNG) =================
 MAX30105 particleSensor;
-const byte POWER_LED = 0x1F; // Medium Power
 
 const byte RATE_SIZE = 4; 
 byte rates[RATE_SIZE]; 
 byte rateSpot = 0;
 long lastBeat = 0; 
 float beatsPerMinute;
-int beatAvg = 0;
-float shared_BPM = 0.0;
+int beatAvg = 0; 
+byte beatCount = 0; 
 
-// ============================================================
-// 4. SETTINGAN SUHU & TIMING
-// ============================================================
-#define DS18B20_PIN 4
-OneWire oneWire(DS18B20_PIN);
-DallasTemperature sensors(&oneWire);
-float shared_Temp = 0.0;
-const float KALIBRASI_SUHU = 0.70; 
+// ================= KONFIGURASI SERIAL GSR (Arduino Nano) =================
+HardwareSerial NanoSerial(2);
+const int NANO_RX_PIN = 16; // ESP32 menerima data dari TX Nano
+const int NANO_TX_PIN = 17; // tidak wajib dipakai (opsional balasan)
 
-unsigned long lastTimeGSR = 0;
-unsigned long lastTimeTemp = 0;
-unsigned long lastTimeWS = 0;
-unsigned long lastTimeFingerCheck = 0;
-unsigned long lastTimePrint = 0;
+float shared_GSR_uS = 0.0f;
+bool gsrDataValid = false;
+String lastGsrLine;
+float gsr_raw = 0.0f;
+float gsr_vcc = 0.0f;
+float gsr_vout = 0.0f;
+float gsr_rest = 0.0f;
 
-const int INTERVAL_GSR = 100;    
-const int INTERVAL_TEMP = 1000;   
-const int INTERVAL_WS = 100;      // Kirim ke Web 10Hz
-const int INTERVAL_PRINT = 200;   // Tampil di Serial 5Hz
-const int INTERVAL_FINGER = 50;   
+// Timer untuk Serial Print (Biar gak spamming terlalu cepat sampai unreadable)
+unsigned long lastPrintTime = 0; 
+const long printInterval = 100; // Print data setiap 100ms (biar terlihat mengalir terus)
 
 // ================= CALLBACK WEBSOCKET =================
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
   switch(type) {
     case WStype_DISCONNECTED:
+      socketIoConnected = false;
       Serial.println("[WS] Disconnected!");
       break;
 
     case WStype_CONNECTED:
+      socketIoConnected = false;
       Serial.printf("[WS] Connected to: %s\n", payload);
-      // HANDSHAKE (Wajib buat Socket.IO)
       webSocket.sendTXT("40");
       Serial.println("[WS] Handshake sent: 40");
       break;
 
-    case WStype_TEXT:
-      // HEARTBEAT (Balas Ping "2" dengan Pong "3")
+    case WStype_TEXT: {
       if (length > 0 && payload[0] == '2') {
-         webSocket.sendTXT("3");
+        webSocket.sendTXT("3");
+        break;
+      }
+
+      String msg;
+      msg.reserve(length + 1);
+      for (size_t i = 0; i < length; i++) msg += static_cast<char>(payload[i]);
+
+      if (msg.length() > 0 && msg[0] == '0') {
+        webSocket.sendTXT("40");
+        Serial.println("[WS] Re-handshake sent: 40");
+      } else if (msg.startsWith("40")) {
+        socketIoConnected = true;
+        Serial.println("[WS] Socket.IO ready!");
       }
       break;
-      
+    }
+
     case WStype_ERROR:
       Serial.println("[WS] Error!");
       break;
   }
 }
 
+void sendWsData() {
+  String json = "42[\"esp32_live_data\",{";
+  json += "\"hr\":" + String(beatAvg) + ",";
+  json += "\"temp\":" + String(tempC_final, 2) + ",";
+  json += "\"eda\":" + String(gsrDataValid ? shared_GSR_uS : 0.0f, 2) + ",";
+  json += "\"device_id\":\"ESP32_001\"";
+  json += "}]";
+
+  webSocket.sendTXT(json);
+}
+
+bool extractFloatAfterKey(const String& source, const char* key, float& out) {
+  int idx = source.indexOf(key);
+  if (idx < 0) return false;
+  idx += strlen(key);
+
+  while (idx < (int)source.length() && source[idx] == ' ') idx++;
+
+  int end = idx;
+  while (end < (int)source.length()) {
+    char c = source[end];
+    if ((c >= '0' && c <= '9') || c == '.' || c == '-') {
+      end++;
+    } else {
+      break;
+    }
+  }
+
+  if (end <= idx) return false;
+  out = source.substring(idx, end).toFloat();
+  return true;
+}
+
+void readGsrFromNano() {
+  while (NanoSerial.available()) {
+    String line = NanoSerial.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    lastGsrLine = line;
+    float rawTemp, vccTemp, voutTemp, restTemp, usTemp;
+    bool okRaw  = extractFloatAfterKey(line, "RAW:", rawTemp);
+    bool okVcc  = extractFloatAfterKey(line, "VCC:", vccTemp);
+    bool okVout = extractFloatAfterKey(line, "Vout:", voutTemp);
+    bool okRest = extractFloatAfterKey(line, "R_est:", restTemp);
+    bool okUs   = extractFloatAfterKey(line, "G:", usTemp);
+
+    if (okRaw)  gsr_raw  = rawTemp;
+    if (okVcc)  gsr_vcc  = vccTemp;
+    if (okVout) gsr_vout = voutTemp;
+    if (okRest) gsr_rest = restTemp;
+    if (okUs) {
+      gsrDataValid = true;
+      shared_GSR_uS = usTemp;
+    }
+  }
+}
+
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n--- SYSTEM STARTING ---");
+  Serial.println("\n\n=== SYSTEM START ===");
 
-  // 1. WIFI
-  Serial.print("Menghubungkan WiFi: ");
-  Serial.println(ssid);
-  WiFi.mode(WIFI_STA); 
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  Serial.println("\n✅ WIFI TERHUBUNG!");
+  // --- 1. SETUP WIFI ---
+  WiFi.mode(WIFI_STA);
+  Serial.print("Mencoba koneksi ke WiFi Hardcoded: ");
+  Serial.println(hardcode_ssid);
+  
+  WiFi.begin(hardcode_ssid, hardcode_pass);
+  
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 10) { // Coba 5 detik
+    delay(500);
+    Serial.print(".");
+    retry++;
+  }
 
-  // 2. WEBSOCKET SSL
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nTerhubung WiFi Hardcode!");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nGagal. Masuk Mode WiFi Manager...");
+    WiFiManager wm;
+    wm.setConfigPortalTimeout(180); 
+    if (!wm.autoConnect(ap_name)) {
+      Serial.println("Timeout. Restart...");
+      ESP.restart();
+    }
+    Serial.println("Terhubung via WiFi Manager!");
+  }
+
+  // --- 2. SETUP SENSOR SUHU ---
+  sensors.begin();
+  sensors.setResolution(11);
+  sensors.setWaitForConversion(false); // PENTING: Non-blocking
+  sensors.requestTemperatures(); 
+  lastTempRequest = millis();
+
+  // --- 3. SETUP SENSOR JANTUNG ---
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 ERROR. Cek Kabel!");
+  } else {
+    particleSensor.setup(); 
+    particleSensor.setPulseAmplitudeRed(0x0A); 
+    particleSensor.setPulseAmplitudeGreen(0); 
+  }
+
+  NanoSerial.begin(9600, SERIAL_8N1, NANO_RX_PIN, NANO_TX_PIN);
+  NanoSerial.setTimeout(5);
+  Serial.println("Serial2 siap terima data GSR dari Nano.");
+
   Serial.print("Menghubungkan Ngrok: ");
   Serial.println(ws_host);
   webSocket.beginSSL(ws_host, ws_port, ws_path);
-  webSocket.onEvent(webSocketEvent); 
-  webSocket.setReconnectInterval(3000); 
-
-  // 3. MAX30102
-  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
-    Serial.println("❌ MAX30102 ERROR"); while (1);
-  }
-  particleSensor.setup(); 
-  particleSensor.setPulseAmplitudeRed(POWER_LED); 
-  particleSensor.setPulseAmplitudeGreen(0);
-
-  // 4. GSR
-  analogReadResolution(12);       
-  analogSetAttenuation(ADC_11db); 
-  pinMode(GSR_PIN, INPUT);
-
-  // 5. SUHU
-  sensors.begin();
-  sensors.setResolution(11);
-  sensors.setWaitForConversion(false); 
-  sensors.requestTemperatures();       
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(3000);
 }
 
 // ================= LOOP =================
 void loop() {
-  webSocket.loop(); // Wajib jalan terus
-  unsigned long currentMillis = millis();
+  webSocket.loop();
+  readGsrFromNano();
+  // -----------------------------------------------------------
+  // BAGIAN 1: HITUNG DETAK JANTUNG (Realtime / Cepat)
+  // -----------------------------------------------------------
+  long irValue = particleSensor.getIR(); 
 
-  // --- A. MAX30102 (Realtime) ---
-  long irValue = particleSensor.getIR();
-  if (checkForBeat(irValue) == true) {
-    long delta = millis() - lastBeat;
-    lastBeat = millis();
-    beatsPerMinute = 60000.0 / delta;
-    if (beatsPerMinute < 255 && beatsPerMinute > 40) {
-      rates[rateSpot++] = (byte)beatsPerMinute;
-      rateSpot %= RATE_SIZE;
-      beatAvg = 0;
-      for (byte x = 0 ; x < RATE_SIZE ; x++) beatAvg += rates[x];
-      beatAvg /= RATE_SIZE;
-      shared_BPM = (float)beatAvg;
-    }
-  }
-  // Reset BPM Logic
-  if (currentMillis - lastTimeFingerCheck >= INTERVAL_FINGER) {
-     lastTimeFingerCheck = currentMillis;
-     if (irValue < 50000) { shared_BPM = 0; beatAvg = 0; for(byte x=0; x<RATE_SIZE; x++) rates[x]=0; }
-  }
+  // Jika ada jari terdeteksi (Threshold IR > 50.000)
+  if (irValue > 50000) {
+    if (checkForBeat(irValue) == true) {
+      long delta = millis() - lastBeat; 
+      lastBeat = millis();
+      
+      beatsPerMinute = 60000.0 / delta; 
 
-  // --- B. GSR (Optimasi Filter Udara) ---
-  if (currentMillis - lastTimeGSR >= INTERVAL_GSR) {
-    lastTimeGSR = currentMillis;
-    long sum = 0;
-    for (int i = 0; i < 20; i++) sum += analogRead(GSR_PIN);
-    float adc12 = sum / 20.0;
-    float adc10 = adc12 * (1023.0f / 4095.0f);
-
-    float adc10Smooth = adc10; // EMA dimatikan
-    
-    // Logika Threshold
-    if (adc10Smooth >= ADC10_MIN && adc10Smooth <= ADC10_MAX) {
-      if (adc10Smooth > BATAS_UDARA) {
-        shared_GSR_Ohm = 0.0f;
-        shared_GSR_uS = 0.0f;
-      } else {
-        float x = adc10Smooth;
-        float R_kOhm = (((K4 * x + K3) * x + K2) * x + K1) * x + K0;
-        float R_Ohm = R_kOhm * 1000.0f; 
-        R_Ohm = fmaxf(R_Ohm, 1.0f); // clamp supaya tidak negatif / nol
-        shared_GSR_Ohm = R_Ohm;
-        shared_GSR_uS = (1.0f / R_Ohm) * 1e6; 
+      if (beatsPerMinute < 255 && beatsPerMinute > 40) {
+        rates[rateSpot++] = (byte)beatsPerMinute; 
+        rateSpot %= RATE_SIZE; 
+        if (beatCount < RATE_SIZE) beatCount++; 
+        
+        // Hitung Rata-rata
+        beatAvg = 0;
+        for (byte x = 0 ; x < RATE_SIZE ; x++) beatAvg += rates[x];
+        if (beatCount > 0) beatAvg /= beatCount;
       }
-    } else {
-      shared_GSR_Ohm = 0.0f; shared_GSR_uS = 0.0f; 
     }
+  } else {
+    // Jika tidak ada jari, Reset BPM jadi 0
+    beatAvg = 0;
+    beatCount = 0;
+    for (byte x = 0 ; x < RATE_SIZE ; x++) rates[x] = 0;
   }
 
-  // --- C. SUHU ---
-  if (currentMillis - lastTimeTemp >= INTERVAL_TEMP) {
-    lastTimeTemp = currentMillis;
-    float tempC = sensors.getTempCByIndex(0);
-    if (tempC > -100) shared_Temp = tempC + KALIBRASI_SUHU;
-    sensors.requestTemperatures();
+  // -----------------------------------------------------------
+  // BAGIAN 2: HITUNG SUHU (Interval 1 Detik / 1 Hz)
+  // -----------------------------------------------------------
+  if (millis() - lastTempRequest >= tempInterval) {
+    // 1. Baca hasil request detik sebelumnya
+    float tempC_raw = sensors.getTempCByIndex(0);
+    
+    // 2. Request baru untuk detik berikutnya
+    sensors.requestTemperatures(); 
+    lastTempRequest = millis();
+
+    // Validasi nilai
+    if(tempC_raw != DEVICE_DISCONNECTED_C && tempC_raw > -127) {
+       tempC_final = tempC_raw + KALIBRASI_OFFSET;
+    }
+    // Jika sensor suhu error/lepas, nilai tempC_final dibiarkan nilai terakhir
   }
 
-  // --- D. KIRIM WEBSOCKET (TANPA OHM) ---
-  if (currentMillis - lastTimeWS >= INTERVAL_WS) {
-    lastTimeWS = currentMillis;
+  // -----------------------------------------------------------
+  // BAGIAN 3: PRINT DATA TERUS MENERUS (Streaming)
+  // -----------------------------------------------------------
+  // Kita update tampilan setiap 100ms agar serial monitor enak dilihat
+  if (millis() - lastPrintTime >= printInterval) {
+    lastPrintTime = millis();
     
-    // Format JSON: Hanya hr, temp, eda (uS)
-    String json = "42[\"esp32_live_data\",{";
-    json += "\"hr\":" + String(shared_BPM) + ",";
-    json += "\"temp\":" + String(shared_Temp, 2) + ",";
-    json += "\"eda\":" + String(shared_GSR_uS, 2) + ",";
-    json += "\"device_id\":\"ESP32_001\"";
-    json += "}]";
+    Serial.print("WS:");
+    Serial.print(socketIoConnected ? "ON" : "OFF");
 
-    webSocket.sendTXT(json);
+    Serial.print(" | WiFi:");
+    Serial.print(WiFi.status() == WL_CONNECTED ? "OK" : "ERR");
+
+    Serial.print(" || BPM:");
+    Serial.print(beatAvg);
+
+    Serial.print(" | Temp:");
+    Serial.print(tempC_final, 2);
+
+    Serial.print(" | RAW:");
+    Serial.print(gsr_raw, 1);
+
+    Serial.print(" | VCC:");
+    Serial.print(gsr_vcc, 3);
+
+    Serial.print(" | Vout:");
+    Serial.print(gsr_vout, 3);
+
+    Serial.print(" | R:");
+    Serial.print(gsr_rest, 2);
+
+    Serial.print(" | uS:");
+    Serial.println(shared_GSR_uS, 4);
+    
+    // Kalau mau liat raw IR value buat debugging sensitivitas, uncomment ini:
+    // Serial.print(" \t| IR: "); Serial.println(irValue);
   }
 
-  // --- E. TAMPILKAN SERIAL (LENGKAP DENGAN OHM) ---
-  if (currentMillis - lastTimePrint >= INTERVAL_PRINT) {
-    lastTimePrint = currentMillis;
-    
-    Serial.print("BPM: "); Serial.print(shared_BPM, 0);
-    Serial.print(" | Temp: "); Serial.print(shared_Temp, 2);
-    Serial.print(" | uS: "); Serial.print(shared_GSR_uS, 2);
-    
-    // Ohm ditampilkan disini saja, tidak dikirim ke web
-    Serial.print(" | Ohm: "); Serial.println(shared_GSR_Ohm, 0);
+  unsigned long now = millis();
+  if (now - lastTimeWS >= INTERVAL_WS) {
+    lastTimeWS = now;
+    sendWsData();
   }
 }
