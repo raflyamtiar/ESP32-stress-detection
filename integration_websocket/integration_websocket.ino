@@ -13,7 +13,7 @@ const char* hardcode_pass = "12321213";
 const char* ap_name = "ESP32_raply"; 
 
 // ================= KONFIGURASI NGROK / SOCKET.IO =================
-const char* ws_host  = "nichelle-attractive-transperitoneally.ngrok-free.dev";
+const char* ws_host  = "premedical-caryl-gawkishly.ngrok-free.dev";
 const int   ws_port  = 443; // Port SSL
 const char* ws_path  = "/socket.io/?EIO=4&transport=websocket&type=esp32";
 
